@@ -72,6 +72,7 @@ cdp add personal --color blue   # create profile + Spotlight launcher
 cdp launch personal             # launch, or focus if already running
 cdp color personal teal         # change the profile's color
 cdp list                        # profiles and launcher health
+cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
 cdp gui                         # (re)build + install the SwiftUI app
 cdp chooser                     # build the AppleScript picker instead
@@ -104,10 +105,30 @@ that instance back into its own account.
   `codesign --verify` still passes and Keychain keeps releasing "Claude
   Safe Storage" — logins survive. Clones live outside Spotlight's index
   (`~/Library/Application Support/claude-desktop-profiles/apps`) so they
-  can't be launched without their `--user-data-dir`.
-- **Staying fresh**: on every launch, if the original Claude.app version
-  differs from the clone's, the clone is rebuilt from scratch and re-iconed
-  — clones can't go stale after Claude updates.
+  can't be launched without their `--user-data-dir`. The clone is exec'd
+  directly (not via `open`) with a scrubbed, launchd-like environment plus
+  `CLAUDE_CONFIG_DIR=<profile>/claude-config`: `--user-data-dir` scopes only
+  Electron's userData, while the Claude Code that Desktop embeds (Code /
+  Cowork tab) otherwise shares `~/.claude`, `~/.claude.json` and the CLI's
+  keychain item with every profile **and** your terminal `claude` — which
+  is how one profile's account email showed up in unrelated CLI sessions.
+- **Re-homing strays**: Claude's self-update relaunches the clone through
+  Squirrel's ShipIt by bundle URL — no argv, no env — so the app comes back
+  on the *default* userData: default account, orange Dock icon, but still
+  titled "Claude <Profile>". Clicking a Dock/Recents entry does the same.
+  `cdp add` installs a LaunchAgent (`cdp watch`, every 3 s) that quits any
+  clone process running without `--user-data-dir` and relaunches it as its
+  profile; `cdp launch` does the same pass first. `cdp watchdog status`
+  shows both.
+- **Staying fresh (self-update, never downgrade)**: each profile updates
+  itself — Squirrel installs into the profile's *own* clone bundle, so a
+  profile stays current on its own schedule, independent of the default. On
+  launch `cdp` only ever moves a clone **forward**: it re-clones when the
+  clone is missing or older than `/Applications`, leaves a clone that has
+  self-updated ahead untouched (re-cloning from an older original would
+  revert the update and trap the app re-downloading it forever), and, once
+  the default catches up to the same version, re-clones once to reclaim APFS
+  block-sharing and restore the profile color a self-update wipes.
 - **Focusing**: if the profile is already running, `cdp launch` activates
   its PID via `NSRunningApplication` instead of re-launching — Claude's
   second-instance handler would otherwise open a new window per click.
@@ -136,13 +157,30 @@ two-account setup on a phone.
 clones, signature intact), launched with a documented Chromium flag, signed
 into accounts you own. Nothing is patched, injected, or intercepted.
 
-**Do the clones eat disk?** No — APFS clones share blocks with the
-original. A clone only takes real space if it diverges (e.g. self-updates),
-and every version bump triggers a fresh re-clone that resets divergence.
+**Do the clones eat disk?** A fresh clone is ~free (APFS block-sharing). A
+clone goes to a full copy (~750 MB) once it **self-updates** — Squirrel
+rewrites the bundle and divergence breaks the sharing. `cdp` reclaims it: as
+soon as your default Claude reaches the same version, the next launch
+re-clones the profile, re-establishing shared blocks. So diverged copies are
+temporary — they collapse back once the default catches up.
 
-**What if Claude updates mid-session?** Running instances keep running.
-The next `cdp launch` notices the version change, rebuilds the clone from
-the updated original, and re-applies the color.
+**How do I update Claude?** You don't have to do anything — **each profile
+updates itself.** Claude's own updater installs into that profile's clone
+bundle, so profiles stay current independently of the default and of each
+other. If a profile shows "Update available", just let it restart like
+normal.
+
+Earlier versions of this tool got this wrong: the clone *did* self-update,
+but on the next launch `cdp` re-cloned from the (possibly older) default and
+silently reverted it — so the app re-downloaded the same update every launch
+and never settled. Fixed: `cdp` now compares versions in order and never
+downgrades a clone (see "Staying fresh" above).
+
+**What if Claude updates mid-session?** The update's relaunch lands on the
+default userData (see "Re-homing strays" above); the watchdog quits that
+instance within seconds and relaunches the profile properly, which also
+restores the color the update wiped from the clone (`cdp` re-applies the
+Finder icon without touching the newer bundle).
 
 **Without Xcode Command Line Tools?** Everything still works; icons stay
 orange (tinting and PID-focus need the small cached Swift helper). 

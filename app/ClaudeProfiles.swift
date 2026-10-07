@@ -22,6 +22,28 @@ let claudeAppPath: String = {
 
 var claudeIcon: NSImage { NSWorkspace.shared.icon(forFile: claudeAppPath) }
 
+// Read fresh every call (NOT via Bundle(path:), which caches infoDictionary
+// and would miss a re-clone). Returns nil if the bundle/plist is absent.
+func bundleVersion(_ appPath: String) -> String? {
+    guard let dict = NSDictionary(contentsOfFile: appPath + "/Contents/Info.plist") else { return nil }
+    return dict["CFBundleShortVersionString"] as? String
+}
+
+// True when `a` is strictly older than `b` (ordered dotted-numeric compare).
+// Mirrors version_lt in bin/cdp — a plain != would wrongly flag a profile
+// that self-updated AHEAD of the default as "behind".
+func versionLessThan(_ a: String, _ b: String) -> Bool {
+    if a == b { return false }
+    let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+    let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(pa.count, pb.count) {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x != y { return x < y }
+    }
+    return false
+}
+
 @discardableResult
 func runTool(_ tool: String, _ args: [String], env: [String: String] = [:]) throws -> String {
     let p = Process()
@@ -88,8 +110,13 @@ final class ProfileStore: ObservableObject {
     @Published var profiles: [Profile] = [Profile(name: "Default", dataDir: nil, colorName: "orange")]
     @Published var running: Set<String> = []
     @Published var errorMessage: String?
+    // Version of the installed Claude.app (the single update source) and the
+    // profiles whose clone is behind it. Drives the update banner.
+    @Published var installedVersion: String = ""
+    @Published var outdatedProfiles: [String] = []
 
     private let appSupport = NSHomeDirectory() + "/Library/Application Support"
+    private let clonesDir = NSHomeDirectory() + "/Library/Application Support/claude-desktop-profiles/apps"
     private var cdpPath: String? { Bundle.main.path(forResource: "cdp", ofType: nil) }
 
     func refresh() {
@@ -136,6 +163,24 @@ final class ProfileStore: ObservableObject {
         // Same deal as refresh(): the 2s poller must not republish an
         // unchanged set, or it closes menus the user is currently using.
         if found != running { running = found }
+
+        // Version drift, informational only. Profiles self-update on their
+        // own; a profile whose clone is strictly OLDER than the installed
+        // default will also catch up (re-clone forward) on its next launch.
+        // We surface just those — never a clone that self-updated AHEAD of
+        // the default, which is fine and must not read as "behind".
+        let installed = bundleVersion(claudeAppPath) ?? ""
+        if installed != installedVersion { installedVersion = installed }
+        var behind: [String] = []
+        if !installed.isEmpty {
+            for p in profiles where !p.isDefault {
+                if let v = bundleVersion(clonesDir + "/Claude \(p.name).app"),
+                   versionLessThan(v, installed) {
+                    behind.append(p.name)
+                }
+            }
+        }
+        if behind != outdatedProfiles { outdatedProfiles = behind }
     }
 
     func launch(_ p: Profile) {
@@ -209,6 +254,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            UpdateBar(installedVersion: store.installedVersion, outdated: store.outdatedProfiles)
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 14) {
                     ForEach(store.profiles) { p in
@@ -288,6 +334,44 @@ struct ContentView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+}
+
+// Profiles self-update on their own, so there's no update chore to nag about.
+// The only thing worth surfacing is a purely informational note: a profile
+// whose clone is behind the installed default will catch up on its next
+// launch. Shown only when such a profile exists; otherwise the bar collapses
+// to nothing. A clone that self-updated AHEAD of the default is never listed.
+struct UpdateBar: View {
+    let installedVersion: String
+    let outdated: [String]
+
+    var body: some View {
+        if outdated.isEmpty {
+            EmptyView()
+        } else {
+            VStack(spacing: 0) {
+                HStack(spacing: 7) {
+                    Image(systemName: "arrow.down.circle")
+                        .foregroundStyle(.secondary)
+                    Text(driftText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+                Divider()
+            }
+        }
+    }
+
+    private var driftText: String {
+        let names = outdated.joined(separator: ", ")
+        let ver = installedVersion.isEmpty ? "" : " \(installedVersion)"
+        let many = outdated.count > 1
+        return "\(names) \(many ? "are" : "is") behind your default Claude\(ver) — \(many ? "they'll" : "it'll") update on \(many ? "their" : "its") next launch."
     }
 }
 

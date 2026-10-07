@@ -33,6 +33,10 @@ CACHE_DIR="$HOME/Library/Caches/claude-desktop-profiles"
 # Per-profile clones of Claude.app (APFS copy-on-write) live here, outside
 # Spotlight's index, so nobody launches one without its --user-data-dir.
 CLONES_DIR="$APP_SUPPORT/claude-desktop-profiles/apps"
+# LaunchAgent running `cdp watch`: re-homes clones that got relaunched
+# without their --user-data-dir (see adopt_strays).
+WATCH_LABEL="$BUNDLE_PREFIX.watch"
+WATCH_PLIST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
 
 # Per-profile icon colors: hue rotation (degrees) applied to Claude's icon.
 # The white spark is unaffected by hue shifts; only the orange square moves.
@@ -54,6 +58,7 @@ typeset -A HUES=(
 err()  { print -u2 -- "✗ $*"; exit 1 }
 ok()   { print -- "✓ $*" }
 info() { print -- "ℹ $*" }
+warn() { print -u2 -- "⚠ $*" }
 
 find_claude_app() {
   local c
@@ -74,26 +79,35 @@ displayify() {
   print -- "${(j: :)out}"
 }
 
-# Compiles (and caches) a small Swift tool that writes a hue-rotated copy of
-# an .icns. Needs swiftc; callers fall back to the plain icon without it.
+# Compiles (and caches) a small Swift helper for icon tinting, Finder icons
+# and window focus. Needs swiftc; callers fall back without it.
+#
+# It lives inside a minimal .app bundle, not as a bare binary: macOS names a
+# process after the bundle it runs from, so Activity Monitor, TCC prompts and
+# any Dock flash show "Claude Profiles Helper" with the manager's grid icon
+# instead of an anonymous "tinticon".
+HELPER_NAME="$CHOOSER_NAME Helper"
 ensure_tint_tool() {
-  local tool="$CACHE_DIR/tinticon"
+  local bundle="$CACHE_DIR/$HELPER_NAME.app"
+  local tool="$bundle/Contents/MacOS/$HELPER_NAME"
+  local icns="$bundle/Contents/Resources/AppIcon.icns"
   if [[ -x "$tool" && ! "$SCRIPT_PATH" -nt "$tool" ]]; then
+    [[ -f "$icns" ]] || helper_icon "$tool" "$icns"
     print -- "$tool"
     return 0
   fi
   command -v swiftc >/dev/null 2>&1 || return 1
   local tmp
   tmp=$(mktemp -d)
-  cat > "$tmp/tinticon.swift" <<'EOF'
+  cat > "$tmp/helper.swift" <<'EOF'
 import AppKit
 import CoreImage
 
-// tinticon tint <src.icns> <dst.icns> <hueDegrees>   hue-rotated copy
-// tinticon grid <src.icns> <dst.icns>                quartered multi-hue manager icon
-// tinticon seticon <icon> <target>                   Finder custom icon (Dock honors it,
-//                                                    and it does not break code signatures)
-// tinticon focus <pid>                               activate a running app by pid
+// helper tint <src.icns> <dst.icns> <hueDegrees>   hue-rotated copy
+// helper grid <src.icns> <dst.icns>                quartered multi-hue manager icon
+// helper seticon <icon> <target>                   Finder custom icon (Dock honors it,
+//                                                  and it does not break code signatures)
+// helper focus <pid>                               activate a running app by pid
 let a = CommandLine.arguments
 guard a.count >= 3 else { exit(2) }
 let mode = a[1]
@@ -184,10 +198,34 @@ try! p.run(); p.waitUntilExit()
 try? FileManager.default.removeItem(at: iconset)
 exit(p.terminationStatus)
 EOF
-  mkdir -p "$CACHE_DIR"
-  swiftc -O -o "$tool" "$tmp/tinticon.swift" 2>/dev/null || { rm -rf "$tmp"; return 1 }
+  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+  rm -f "$CACHE_DIR/tinticon"
+  swiftc -O -o "$tool" "$tmp/helper.swift" 2>/dev/null || { rm -rf "$tmp"; return 1 }
   rm -rf "$tmp"
+  cat > "$bundle/Contents/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>CFBundleExecutable</key><string>$HELPER_NAME</string>
+	<key>CFBundleIdentifier</key><string>$BUNDLE_PREFIX.helper</string>
+	<key>CFBundleName</key><string>$HELPER_NAME</string>
+	<key>CFBundleDisplayName</key><string>$HELPER_NAME</string>
+	<key>CFBundleIconFile</key><string>AppIcon</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>LSUIElement</key><true/>
+</dict></plist>
+EOF
+  helper_icon "$tool" "$icns"
   print -- "$tool"
+}
+
+# The helper's own icon is the same multi-hue grid as the manager app. Skipped
+# silently when Claude.app is missing; retried on the next call.
+helper_icon() {
+  local tool="$1" out="$2" claude_app src
+  claude_app=$(find_claude_app 2>/dev/null) || return 0
+  src=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
+  [[ -n "$src" ]] && "$tool" grid "$src" "$out" 2>/dev/null || true
 }
 
 # Writes the profile icon (hue-rotated when hue != 0 and swiftc is available,
@@ -226,12 +264,97 @@ app_version() {
   /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$1/Contents/Info.plist" 2>/dev/null || print -- "?"
 }
 
+# Ordered compare of dotted-numeric versions: `version_lt A B` is true when A
+# is strictly older than B. Used so we never DOWNGRADE a clone — a profile
+# self-updates via Squirrel into its own bundle, and a plain `!=` check would
+# treat "clone newer than the installed Claude" as drift and re-clone from the
+# older /Applications, reverting the update (the app would then re-download it
+# forever, losing its custom icon each cycle).
+version_lt() {
+  [[ "$1" == "$2" ]] && return 1
+  local first
+  first=$(print -l -- "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n 2>/dev/null | head -1)
+  [[ "$first" == "$1" ]]
+}
+
+# A bundle carries its Finder custom icon (our profile color) as an `Icon\r`
+# file inside the bundle dir. A Squirrel self-update replaces the bundle and
+# drops it, so its absence on a colored profile means "self-updated since we
+# last touched it".
+has_custom_icon() {
+  [[ -f "$1/Icon"$'\r' ]]
+}
+
 # PID of the main Claude process using this data dir (any bundle — original
 # or clone), empty when not running. The trailing `|| true` matters: under
 # `set -euo pipefail` a no-match grep (exit 1) would otherwise kill the
 # whole script at the call site's assignment.
 instance_pid() {
   ps -axo pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$1" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | awk '{print $1}' | head -1 || true
+}
+
+# Claude Code's config dir for this profile. --user-data-dir only scopes
+# Electron's userData; the Claude Code that Desktop embeds (Code/Cowork tab)
+# reads CLAUDE_CONFIG_DIR from the Desktop process env and otherwise shares
+# ~/.claude, ~/.claude.json and the CLI keychain item with every other
+# profile AND the terminal CLI — which is how one profile's account email
+# ended up in unrelated `claude` sessions. Lives inside the data dir so it
+# travels with the profile.
+config_dir_of_profile() {
+  print -- "$1/claude-config"
+}
+
+# Starts the clone with the profile's data dir AND a private Claude Code
+# config dir. Exec'd directly instead of `open`: `open` hands LaunchServices
+# a clean env, so CLAUDE_CONFIG_DIR would never reach the app. The env is
+# reset to what launchd would give a Spotlight-launched app, so nothing from
+# the calling shell (a terminal, a Claude Code session) leaks in either.
+launch_clone() {
+  local clone="$1" data_dir="$2" cfg
+  cfg=$(config_dir_of_profile "$data_dir")
+  # Hard invariant: a clone process must never exist without BOTH its
+  # --user-data-dir and its CLAUDE_CONFIG_DIR. Refuse rather than start a
+  # process that would fall back to the shared/default identity.
+  [[ -n "$data_dir" && -n "$cfg" ]] || err "Refusing to launch: empty data or config dir."
+  [[ -x "$clone/Contents/MacOS/Claude" ]] || err "Refusing to launch: clone binary missing at $clone."
+  mkdir -p "$cfg"
+  nohup /usr/bin/env -i \
+    HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="${SHELL:-/bin/zsh}" \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    TMPDIR="$(getconf DARWIN_USER_TEMP_DIR)" LANG="${LANG:-en_US.UTF-8}" \
+    ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} \
+    CLAUDE_CONFIG_DIR="$cfg" \
+    "$clone/Contents/MacOS/Claude" --user-data-dir="$data_dir" >/dev/null 2>&1 &!
+}
+
+# Clone processes running WITHOUT --user-data-dir, as "pid<TAB>Display".
+# Squirrel's post-update relaunch (ShipIt) — and a click on a Dock/Recents
+# entry — start the bundle by URL with no argv and no env, so the clone
+# comes up on the DEFAULT userData: default account, orange Dock icon, but
+# still titled "Claude <Profile>". Args are the only thing `ps` lets us
+# check (hardened runtime hides env), and both are dropped together.
+stray_pids() {
+  local line pid cmd rest display
+  ps -axo pid=,command= 2>/dev/null | grep -F -- "$CLONES_DIR/" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | grep -vF -- "--user-data-dir=" | while IFS= read -r line; do
+    pid="${line##[[:space:]]#}"; pid="${pid%% *}"
+    cmd="${line#*"$CLONES_DIR/"}"
+    display="${${cmd%%.app/Contents/MacOS/Claude*}#Claude }"
+    [[ -n "$display" ]] && print -- "$pid"$'\t'"$display"
+  done || true
+}
+
+# Quits every stray clone and relaunches it as its profile. Idempotent:
+# converges to "every clone process carries its --user-data-dir".
+adopt_strays() {
+  local entry pid display i
+  stray_pids | while IFS=$'\t' read -r pid display; do
+    info "Clone '$display' is running without its profile (post-update relaunch?) — re-homing."
+    kill -TERM "$pid" 2>/dev/null || continue
+    for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    sleep 1
+    launch_profile "$display" || true
+  done
 }
 
 # Sets the clone's Finder custom icon to the profile color. Finder icons are
@@ -247,16 +370,39 @@ apply_clone_icon() {
   rm -rf "$tmp"
 }
 
-# Creates or refreshes the profile's Claude.app clone. Re-clones whenever the
-# original's version differs, so clones can never go stale after an update
-# (and the custom icon, which updates would wipe, is re-applied).
+# Brings the profile's Claude.app clone into a good state WITHOUT ever
+# downgrading it. A profile self-updates via Squirrel into this very clone, so
+# the clone may legitimately be AHEAD of /Applications; re-cloning from the
+# older original would revert that update and trap the app in a re-download
+# loop. Rules:
+#   - clone missing              -> clone
+#   - clone older than original  -> re-clone (move it forward)
+#   - clone == original but the
+#     self-update wiped its icon  -> re-clone (reclaim APFS sharing + recolor)
+#   - clone ahead of original     -> leave the newer bundle, just restore icon
 ensure_clone() {
   local claude_app="$1" clone="$2" color="$3"
-  if [[ ! -d "$clone" || "$(app_version "$claude_app")" != "$(app_version "$clone")" ]]; then
+  local ov cv reclone=0
+  ov=$(app_version "$claude_app")
+  cv=$(app_version "$clone")
+
+  if [[ ! -d "$clone" ]]; then
+    reclone=1
+  elif [[ "$ov" != "?" && "$cv" != "?" ]] && version_lt "$cv" "$ov"; then
+    reclone=1
+  elif [[ "$cv" == "$ov" && "$color" != "orange" ]] && ! has_custom_icon "$clone"; then
+    reclone=1
+  fi
+
+  if (( reclone )); then
     info "Refreshing profile app clone (APFS copy-on-write)…"
     rm -rf "$clone"
     mkdir -p "${clone:h}"
     /bin/cp -Rc "$claude_app" "$clone" 2>/dev/null || /bin/cp -R "$claude_app" "$clone"
+    apply_clone_icon "$claude_app" "$clone" "$color"
+  elif [[ "$color" != "orange" ]] && ! has_custom_icon "$clone"; then
+    # Clone is at/ahead of /Applications (self-updated) — keep the newer bundle
+    # intact and only restore the color the update dropped.
     apply_clone_icon "$claude_app" "$clone" "$color"
   fi
 }
@@ -329,6 +475,10 @@ cmd_add() {
   app_path="$LAUNCHER_DIR/Claude $display.app"
   claude_app=$(find_claude_app)
 
+  # An existing data folder means this is a rebuild, not a new profile. It
+  # doesn't prove sign-in ever finished; good enough to skip the login hint.
+  local existed=0
+  [[ -d "$data_dir" ]] && existed=1
   mkdir -p "$data_dir"
 
   # Recreating a launcher for an existing profile keeps its color unless a
@@ -357,14 +507,21 @@ EOF
   chmod +x "$app_path/Contents/Resources/cdp"
   /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
 
-  ok "Profile '$display' created (color: $color)."
+  if (( existed )); then
+    ok "Profile '$display' updated (color: $color)."
+  else
+    ok "Profile '$display' created (color: $color)."
+  fi
   info "Data folder:  $data_dir"
   info "Launcher:     $app_path  (Spotlight: 'Claude $display')"
-  print
-  info "First launch: QUIT every other Claude window first (the claude:// login"
-  info "deep link lands on whichever instance is running), open the launcher,"
-  info "sign in, done. After that all profiles can run simultaneously."
+  if (( ! existed )); then
+    print
+    info "First launch: QUIT every other Claude window first (the claude:// login"
+    info "deep link lands on whichever instance is running), open the launcher,"
+    info "sign in, done. After that all profiles can run simultaneously."
+  fi
 
+  install_watchdog --quiet
   rebuild_chooser_unless_nested
 }
 
@@ -464,15 +621,13 @@ EOF
   [[ "${1:-}" == "--quiet" ]] || ok "Chooser rebuilt: $LAUNCHER_DIR/$CHOOSER_NAME.app  (Spotlight: '$CHOOSER_NAME')"
 }
 
-cmd_launch() {
-  # The single launch path used by the Spotlight launchers, the GUI, and the
-  # chooser. Launches the profile from its own Claude.app clone — so the
-  # running Dock tile wears the profile color and owns the window — or
-  # focuses the existing instance without spawning a new window (Claude's
-  # second-instance handler opens a window per repeated launch attempt,
-  # so we activate the PID directly instead).
-  local raw="${1:-}"
-  [[ -n "$raw" ]] || err "Usage: cdp launch <name>"
+# Launches the profile from its own Claude.app clone — so the running Dock
+# tile wears the profile color and owns the window — or focuses the existing
+# instance without spawning a new window (Claude's second-instance handler
+# opens a window per repeated launch attempt, so we activate the PID
+# directly instead).
+launch_profile() {
+  local raw="$1"
   local display data_dir color clone claude_app pid tool
   display=$(displayify "$(slugify "$raw")")
   data_dir="$APP_SUPPORT/Claude-$display"
@@ -483,15 +638,104 @@ cmd_launch() {
 
   pid=$(instance_pid "$data_dir")
   if [[ -n "$pid" ]]; then
+    # Already running and isolated (matched by --user-data-dir). Only raise
+    # its window. NEVER fall back to a bare `open`: `open` starts the clone
+    # with no --user-data-dir and no CLAUDE_CONFIG_DIR, i.e. on the DEFAULT
+    # identity — the exact cross-profile leak this tool exists to prevent.
+    # If focus fails the instance is still up and isolated; the user clicks
+    # its Dock tile. We refuse to launch anything unisolated.
     if tool=$(ensure_tint_tool) && "$tool" focus "$pid" 2>/dev/null; then
       return 0
     fi
-    open "$clone" 2>/dev/null || open -a "$claude_app"
+    warn "Profile '$display' is running (pid $pid) but could not be focused. Click its Dock tile; not relaunching to avoid a non-isolated instance."
     return 0
   fi
 
   ensure_clone "$claude_app" "$clone" "$color"
-  open "$clone" --args --user-data-dir="$data_dir"
+  launch_clone "$clone" "$data_dir"
+}
+
+cmd_launch() {
+  # The single launch path used by the Spotlight launchers, the GUI, and the
+  # chooser. Re-homes any stray clone first so a post-update relaunch can't
+  # keep serving the default account under a profile's name.
+  local raw="${1:-}"
+  [[ -n "$raw" ]] || err "Usage: cdp launch <name>"
+  adopt_strays
+  launch_profile "$raw"
+}
+
+cmd_watch() {
+  # `cdp watch` loops forever (LaunchAgent); `cdp watch --once` is one pass.
+  if [[ "${1:-}" == "--once" ]]; then
+    adopt_strays
+    return 0
+  fi
+  while :; do
+    adopt_strays
+    sleep 3
+  done
+}
+
+# Installs/removes the LaunchAgent that runs `cdp watch`. Idempotent: rewrites
+# and reloads only when the plist content changed or the agent isn't loaded.
+install_watchdog() {
+  local quiet="${1:-}" tmp
+  tmp=$(mktemp)
+  cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>$WATCH_LABEL</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>$SCRIPT_PATH</string>
+		<string>watch</string>
+	</array>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+EOF
+  local loaded=0
+  launchctl print "gui/$(id -u)/$WATCH_LABEL" >/dev/null 2>&1 && loaded=1
+  if (( loaded )) && cmp -s "$tmp" "$WATCH_PLIST"; then
+    rm -f "$tmp"
+    [[ "$quiet" == "--quiet" ]] || ok "Watchdog already installed: $WATCH_PLIST"
+    return 0
+  fi
+  mkdir -p "${WATCH_PLIST:h}"
+  (( loaded )) && launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null
+  mv "$tmp" "$WATCH_PLIST"
+  launchctl bootstrap "gui/$(id -u)" "$WATCH_PLIST"
+  [[ "$quiet" == "--quiet" ]] || ok "Watchdog installed: $WATCH_PLIST (runs: cdp watch)"
+}
+
+uninstall_watchdog() {
+  launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+  rm -f "$WATCH_PLIST"
+  ok "Watchdog removed."
+}
+
+cmd_watchdog() {
+  case "${1:-status}" in
+    install)   install_watchdog ;;
+    uninstall) uninstall_watchdog ;;
+    status)
+      if launchctl print "gui/$(id -u)/$WATCH_LABEL" >/dev/null 2>&1; then
+        ok "Watchdog loaded ($WATCH_LABEL)."
+      else
+        info "Watchdog not loaded. Install with: cdp watchdog install"
+      fi
+      local s
+      s=$(stray_pids)
+      [[ -n "$s" ]] && print -- "Strays:"$'\n'"$s" || info "No stray clones."
+      ;;
+    *) err "Usage: cdp watchdog [install|uninstall|status]" ;;
+  esac
 }
 
 cmd_color() {
@@ -642,7 +886,13 @@ USAGE
                       (e.g. cdp add personal --color blue)
   cdp launch <name>   Launch a profile (or focus it if already running).
                       Runs from a per-profile Claude.app clone, so the Dock
-                      tile wears the profile color and owns the window
+                      tile wears the profile color and owns the window, with
+                      its own Claude Code config dir (CLAUDE_CONFIG_DIR)
+  cdp watchdog [install|uninstall|status]
+                      LaunchAgent that re-homes a clone relaunched without
+                      its profile (Claude's self-update does that). Installed
+                      automatically by cdp add
+  cdp watch [--once]  What the watchdog runs
   cdp color <name> <c>
                       Change a profile's icon color
                       (orange red yellow green teal blue purple pink)
@@ -655,7 +905,8 @@ USAGE
                       requirements, same Spotlight name, fewer looks
   cdp help            This text
 
-Profiles live in ~/Library/Application Support/Claude-<Name>.
+Profiles live in ~/Library/Application Support/Claude-<Name>; that profile's
+Claude Code config (Code/Cowork tab) lives in <profile>/claude-config.
 Launchers live in ~/Applications and are indexed by Spotlight.
 EOF
 }
@@ -665,6 +916,8 @@ EOF
 case "${1:-help}" in
   add)     shift; cmd_add "$@" ;;
   launch)  shift; cmd_launch "$@" ;;
+  watch)   shift; cmd_watch "$@" ;;
+  watchdog) shift; cmd_watchdog "$@" ;;
   color)   shift; cmd_color "$@" ;;
   list)    cmd_list ;;
   remove)  shift; cmd_remove "$@" ;;
