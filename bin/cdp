@@ -535,6 +535,9 @@ EOF
 
 cmd_chooser() {
   local claude_app tmp
+  # Same bundle path as the SwiftUI app: building here would replace the GUI.
+  [[ "${1:-}" == "--force" || ! -x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/MacOS/ClaudeProfiles" ]] ||
+    err "The SwiftUI app is installed at $LAUNCHER_DIR/$CHOOSER_NAME.app; 'cdp chooser' would replace it. Use 'cdp gui' to rebuild it, or 'cdp chooser --force'."
   claude_app=$(find_claude_app)
   tmp=$(mktemp -d)
 
@@ -910,7 +913,8 @@ USAGE
   cdp gui             Build + install the "Claude Profiles" SwiftUI app
                       (needs Xcode Command Line Tools; run from repo checkout)
   cdp chooser         Build the AppleScript picker instead — zero build
-                      requirements, same Spotlight name, fewer looks
+                      requirements, same Spotlight name, fewer looks;
+                      refuses to replace the SwiftUI app without --force
   cdp help            This text
 
 Profiles live in ~/Library/Application Support/Claude-<Name>; that profile's
@@ -930,7 +934,7 @@ case "${1:-help}" in
   list)    cmd_list ;;
   remove)  shift; cmd_remove "$@" ;;
   gui)     cmd_gui ;;
-  chooser) cmd_chooser ;;
+  chooser) shift; cmd_chooser "$@" ;;
   help|-h|--help) cmd_help ;;
   *) err "Unknown command: $1 (try: cdp help)" ;;
 esac
