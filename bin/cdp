@@ -394,6 +394,14 @@ ensure_clone() {
     reclone=1
   fi
 
+  # Claude's updater can replace the clone in place as root (seen on
+  # 2.26454.2), leaving a bundle we can neither refresh nor re-icon; the rm
+  # would fail file by file and the launch would die silently.
+  if [[ -d "$clone" ]] && { (( reclone )) || { [[ "$color" != "orange" ]] && ! has_custom_icon "$clone" } }; then
+    [[ -z "$(find "$clone" ! -user "$USER" -print -quit 2>/dev/null)" ]] ||
+      err "Profile app clone is not owned by you (Claude's updater ran as root). Fix: sudo rm -rf '$clone'"
+  fi
+
   if (( reclone )); then
     info "Refreshing profile app clone (APFS copy-on-write)…"
     rm -rf "$clone"
