@@ -199,7 +199,6 @@ try? FileManager.default.removeItem(at: iconset)
 exit(p.terminationStatus)
 EOF
   mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-  rm -f "$CACHE_DIR/tinticon"
   swiftc -O -o "$tool" "$tmp/helper.swift" 2>/dev/null || { rm -rf "$tmp"; return 1 }
   rm -rf "$tmp"
   cat > "$bundle/Contents/Info.plist" <<EOF
@@ -469,6 +468,53 @@ rebuild_chooser_unless_nested() {
   cmd_chooser --quiet
 }
 
+# The launcher is a fire-and-forget button: it calls the bundled cdp's
+# `launch`, which starts the profile from its own Claude.app clone (whose
+# Dock tile wears the profile color and owns the window) or focuses the
+# already-running instance, then the applet exits. stderr stays attached so
+# a failed launch surfaces as an alert instead of dying silently.
+build_launcher() {
+  local slug="$1" display="$2" color="$3" claude_app="$4" tmp
+  local app_path="$LAUNCHER_DIR/Claude $display.app"
+  tmp=$(mktemp -d)
+  cat > "$tmp/launcher.applescript" <<EOF
+on run
+	try
+		do shell script "/bin/zsh " & quoted form of (POSIX path of (path to me) & "Contents/Resources/cdp") & " launch " & quoted form of "$slug" & " > /dev/null"
+	on error msg
+		display alert "Could not launch Claude $display" message msg as critical
+	end try
+end run
+EOF
+  compile_launcher "$tmp/launcher.applescript" "$app_path" "$BUNDLE_PREFIX.$slug" "$claude_app" "$(hue_for_color "$color")"
+  rm -rf "$tmp"
+
+  # Bundle cdp so the launcher drives the same launch path as the GUI and
+  # CLI, then re-sign (the copy broke the seal).
+  cp "$SCRIPT_PATH" "$app_path/Contents/Resources/cdp"
+  chmod +x "$app_path/Contents/Resources/cdp"
+  /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
+}
+
+# Every installed piece carries a copy of (or runs) this script: the manager
+# app, each profile launcher, the watchdog process and the helper. Installing
+# the manager brings all of them to this version so an update never leaves
+# an old copy behind. Launchers whose profile has no launcher (removed with
+# --keep-data) stay removed.
+sync_install() {
+  local claude_app d display
+  claude_app=$(find_claude_app)
+  for d in "$APP_SUPPORT"/Claude-*(N/); do
+    display="${${d:t}#Claude-}"
+    [[ -d "$LAUNCHER_DIR/Claude $display.app" ]] || continue
+    build_launcher "$(slugify "$display")" "$display" "$(color_of_profile "$d")" "$claude_app"
+  done
+  install_watchdog --quiet --restart
+  # Pre-bundle helper binary: a TCC-denied anonymous "tinticon".
+  rm -f "$CACHE_DIR/tinticon"
+  ensure_tint_tool >/dev/null || true
+}
+
 # ---- commands ---------------------------------------------------------------
 
 cmd_add() {
@@ -495,30 +541,7 @@ cmd_add() {
   [[ -n "${HUES[$color]+x}" ]] || err "Unknown color '$color'. Available: ${(k)HUES}"
   print -- "$color" > "$data_dir/.cdp-color"
 
-  # The launcher is a fire-and-forget button: it calls the bundled cdp's
-  # `launch`, which starts the profile from its own Claude.app clone (whose
-  # Dock tile wears the profile color and owns the window) or focuses the
-  # already-running instance, then the applet exits. stderr stays attached so
-  # a failed launch surfaces as an alert instead of dying silently.
-  local tmp
-  tmp=$(mktemp -d)
-  cat > "$tmp/launcher.applescript" <<EOF
-on run
-	try
-		do shell script "/bin/zsh " & quoted form of (POSIX path of (path to me) & "Contents/Resources/cdp") & " launch " & quoted form of "$slug" & " > /dev/null"
-	on error msg
-		display alert "Could not launch Claude $display" message msg as critical
-	end try
-end run
-EOF
-  compile_launcher "$tmp/launcher.applescript" "$app_path" "$BUNDLE_PREFIX.$slug" "$claude_app" "$(hue_for_color "$color")"
-  rm -rf "$tmp"
-
-  # Bundle cdp so the launcher drives the same launch path as the GUI and
-  # CLI, then re-sign (the copy broke the seal).
-  cp "$SCRIPT_PATH" "$app_path/Contents/Resources/cdp"
-  chmod +x "$app_path/Contents/Resources/cdp"
-  /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
+  build_launcher "$slug" "$display" "$color" "$claude_app"
 
   if (( existed )); then
     ok "Profile '$display' updated (color: $color)."
@@ -637,6 +660,7 @@ EOF
   chmod +x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/cdp"
   make_manager_icns "$claude_app" "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/applet.icns" || true
   /usr/bin/codesign --force --sign - "$LAUNCHER_DIR/$CHOOSER_NAME.app" 2>/dev/null || true
+  sync_install
 
   [[ "${1:-}" == "--quiet" ]] || ok "Chooser rebuilt: $LAUNCHER_DIR/$CHOOSER_NAME.app  (Spotlight: '$CHOOSER_NAME')"
 }
@@ -691,16 +715,23 @@ cmd_watch() {
     adopt_strays
     return 0
   fi
+  # zsh keeps the functions it parsed at start, so a long-lived watch would
+  # run stale code forever after a `git pull`; re-exec when the file changes.
+  local stamp
+  stamp=$(stat -f %m "$SCRIPT_PATH")
   while :; do
+    [[ "$(stat -f %m "$SCRIPT_PATH" 2>/dev/null)" == "$stamp" ]] ||
+      exec /bin/zsh "$SCRIPT_PATH" watch
     adopt_strays
     sleep 3
   done
 }
 
 # Installs/removes the LaunchAgent that runs `cdp watch`. Idempotent: rewrites
-# and reloads only when the plist content changed or the agent isn't loaded.
+# and reloads only when the plist content changed or the agent isn't loaded;
+# --restart also restarts an up-to-date agent.
 install_watchdog() {
-  local quiet="${1:-}" tmp
+  local quiet="${1:-}" restart="${2:-}" tmp
   tmp=$(mktemp)
   cat > "$tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -724,6 +755,7 @@ EOF
   launchctl print "gui/$(id -u)/$WATCH_LABEL" >/dev/null 2>&1 && loaded=1
   if (( loaded )) && cmp -s "$tmp" "$WATCH_PLIST"; then
     rm -f "$tmp"
+    [[ "$restart" == "--restart" ]] && launchctl kickstart -k "gui/$(id -u)/$WATCH_LABEL"
     [[ "$quiet" == "--quiet" ]] || ok "Watchdog already installed: $WATCH_PLIST"
     return 0
   fi
@@ -838,9 +870,14 @@ EOF
   /usr/bin/codesign --force --sign - "$bundle" 2>/dev/null || true
 
   mkdir -p "$LAUNCHER_DIR"
+  # A running GUI keeps executing the replaced binary; restart it on the new one.
+  local running=0
+  pkill -f "$app/Contents/MacOS/ClaudeProfiles" 2>/dev/null && running=1
   rm -rf "$app"
   mv "$bundle" "$app"
   rm -rf "$tmp"
+  sync_install
+  (( running )) && open "$app"
   ok "GUI installed: $app  (Spotlight: '$CHOOSER_NAME')"
 }
 

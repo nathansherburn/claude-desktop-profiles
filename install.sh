@@ -20,11 +20,18 @@ else
     "$CDP" chooser
 fi
 
-# Best-effort CLI symlink; the GUI is fully usable without it.
-if ln -sf "$CDP" /usr/local/bin/cdp 2>/dev/null; then
-    echo "✓ cdp linked into /usr/local/bin"
+# Best-effort CLI symlink into the first writable bin dir already on PATH;
+# the GUI is fully usable without it.
+linked=""
+for dir in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin"; do
+    case ":$PATH:" in *":$dir:"*) ;; *) continue ;; esac
+    [ -d "$dir" ] && [ -w "$dir" ] || continue
+    ln -sf "$CDP" "$dir/cdp" && linked="$dir" && break
+done
+if [ -n "$linked" ]; then
+    echo "✓ cdp linked into $linked"
 else
-    echo "ℹ Couldn't link into /usr/local/bin (permissions). For the CLI, add to PATH:"
+    echo "ℹ No writable bin dir on PATH. For the CLI, add to PATH:"
     echo "    export PATH=\"$PWD/bin:\$PATH\""
 fi
 
