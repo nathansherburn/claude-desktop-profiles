@@ -14,6 +14,13 @@ import Combine
 
 // MARK: - Shared helpers
 
+// Since the macOS 27 SDK, `@State` resolves to a SwiftUI macro whose plugin
+// (libSwiftUIMacros) ships only with Xcode, not the Command Line Tools, so a
+// CLT-only `cdp gui` fails. Spelling the attribute through an alias applies
+// the plain State property wrapper instead: same type, same behavior, and it
+// builds with either toolchain.
+typealias ViewState<Value> = State<Value>
+
 let claudeAppPath: String = {
     let candidates = ["/Applications/Claude.app",
                       NSHomeDirectory() + "/Applications/Claude.app"]
@@ -243,9 +250,9 @@ struct ClaudeProfilesApp: App {
 
 struct ContentView: View {
     @StateObject private var store = ProfileStore()
-    @State private var showAdd = false
-    @State private var removing: Profile?
-    @State private var confirmWipe: Profile?
+    @ViewState private var showAdd = false
+    @ViewState private var removing: Profile?
+    @ViewState private var confirmWipe: Profile?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 14)]
@@ -393,7 +400,7 @@ struct ProfileCard: View {
     let reveal: () -> Void
     let setColor: ((String) -> Void)?
     let remove: (() -> Void)?
-    @State private var hovering = false
+    @ViewState private var hovering = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -494,7 +501,7 @@ struct ProfileCard: View {
 
 struct AddCard: View {
     let action: () -> Void
-    @State private var hovering = false
+    @ViewState private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -525,8 +532,8 @@ struct AddCard: View {
 
 struct AddSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var colorName = "orange"
+    @ViewState private var name = ""
+    @ViewState private var colorName = "orange"
     let create: (String, String) -> Void
 
     var body: some View {
