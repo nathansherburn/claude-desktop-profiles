@@ -787,8 +787,19 @@ cmd_watch() {
 # Installs/removes the LaunchAgent that runs `cdp watch`. Idempotent: rewrites
 # and reloads only when the plist content changed or the agent isn't loaded;
 # --restart also restarts an up-to-date agent.
+#
+# The agent runs a private copy of this script, refreshed only here (i.e. on
+# add/gui/chooser). Pointing it at $SCRIPT_PATH would make a `git pull` in the
+# checkout go live within seconds without an install, and the plist would
+# flip between the repo and app-bundle copies depending on who ran last.
+WATCH_SCRIPT="$APP_SUPPORT/claude-desktop-profiles/cdp"
 install_watchdog() {
-  local quiet="${1:-}" restart="${2:-}" tmp
+  local quiet="${1:-}" restart="${2:-}" tmp xml_script
+  if [[ "$SCRIPT_PATH" != "$WATCH_SCRIPT" ]] && ! cmp -s "$SCRIPT_PATH" "$WATCH_SCRIPT"; then
+    mkdir -p "${WATCH_SCRIPT:h}"
+    cp "$SCRIPT_PATH" "$WATCH_SCRIPT.tmp" && chmod 755 "$WATCH_SCRIPT.tmp" && mv -f "$WATCH_SCRIPT.tmp" "$WATCH_SCRIPT"
+  fi
+  xml_script="${${${WATCH_SCRIPT//&/&amp;}//</&lt;}//>/&gt;}"
   tmp=$(mktemp)
   cat > "$tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -799,7 +810,7 @@ install_watchdog() {
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>$SCRIPT_PATH</string>
+		<string>$xml_script</string>
 		<string>watch</string>
 	</array>
 	<key>RunAtLoad</key><true/>
@@ -825,7 +836,7 @@ EOF
 
 uninstall_watchdog() {
   launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
-  rm -f "$WATCH_PLIST"
+  rm -f "$WATCH_PLIST" "$WATCH_SCRIPT"
   ok "Watchdog removed."
 }
 

@@ -121,7 +121,10 @@ that instance back into its own account.
   titled "Claude <Profile>". Clicking a Dock/Recents entry does the same.
   `cdp add` installs a LaunchAgent (`cdp watch`, every 3 s) that quits any
   clone process running without `--user-data-dir` and relaunches it as its
-  profile; `cdp launch` does the same pass first. `cdp watchdog status`
+  profile. It runs a private copy of `cdp` in
+  `~/Library/Application Support/claude-desktop-profiles/`, refreshed only
+  when you install or add a profile, so a `git pull` never goes live on its
+  own; `cdp launch` does the same pass first. `cdp watchdog status`
   shows both.
 - **Staying fresh (self-update, never downgrade)**: each profile updates
   itself — Squirrel installs into the profile's *own* clone bundle, so a
