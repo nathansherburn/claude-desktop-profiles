@@ -96,7 +96,10 @@ that instance back into its own account.
 - A profile **is** a folder: `~/Library/Application Support/Claude-<Name>`.
   There is no registry, database, or state file — the GUI, the chooser, and
   the CLI all discover profiles from the filesystem at runtime. The color
-  lives in `<folder>/.cdp-color`, so it travels with the profile.
+  lives in `<folder>/.cdp-color`, so it travels with the profile; that file
+  is also what marks a folder as a profile, because Claude Desktop creates
+  its own `Claude-3p` folder (third-party inference data) in the same place.
+  The name `3p` is reserved for that reason.
 - **Launching** (`cdp launch`, which everything routes through): each
   profile runs from its own clone of Claude.app, created with `cp -c` —
   an APFS copy-on-write clone, ~0.5 s and near-zero disk. The clone gets a

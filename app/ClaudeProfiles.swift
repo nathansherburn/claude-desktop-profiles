@@ -3,8 +3,10 @@
 // This app is a frontend only: profile creation and removal shell out to the
 // copy of `cdp` bundled in Resources, so the CLI, the AppleScript chooser,
 // and this app share one implementation. Profiles are discovered from the
-// filesystem (~/Library/Application Support/Claude-<Name>) on every refresh;
-// there is no registry to sync. Running instances are detected by reading
+// filesystem (~/Library/Application Support/Claude-<Name> holding the
+// .cdp-color marker `cdp add` writes — Claude Desktop creates its own
+// Claude-3p there) on every refresh; there is no registry to sync. Running
+// instances are detected by reading
 // each Claude process's --user-data-dir argument out of `ps`, because all
 // instances share one binary and differ only in that flag.
 
@@ -133,9 +135,9 @@ final class ProfileStore: ObservableObject {
             for entry in entries.sorted() where entry.hasPrefix("Claude-") {
                 var isDir: ObjCBool = false
                 let full = appSupport + "/" + entry
-                if fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue {
-                    let color = (try? String(contentsOfFile: full + "/.cdp-color", encoding: .utf8))?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "orange"
+                if fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue,
+                   let marker = try? String(contentsOfFile: full + "/.cdp-color", encoding: .utf8) {
+                    let color = marker.trimmingCharacters(in: .whitespacesAndNewlines)
                     list.append(Profile(name: String(entry.dropFirst("Claude-".count)),
                                         dataDir: full, colorName: color))
                 }
