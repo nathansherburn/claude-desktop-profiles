@@ -160,8 +160,11 @@ final class ProfileStore: ObservableObject {
                   !line.contains("Helper") else { continue }
             if let r = line.range(of: "--user-data-dir=") {
                 let rest = String(line[r.upperBound...])
+                // Exact match, as in has_data_dir_arg in bin/cdp: ps joins
+                // argv with spaces, so ".../Claude-Work" is a prefix of
+                // ".../Claude-Work Two".
                 for p in profiles {
-                    if let d = p.dataDir, rest.hasPrefix(d) { found.insert(p.id) }
+                    if let d = p.dataDir, rest == d || rest.hasPrefix(d + " -") { found.insert(p.id) }
                 }
             } else if line.contains("Claude.app/Contents/MacOS/Claude") {
                 found.insert("Default")

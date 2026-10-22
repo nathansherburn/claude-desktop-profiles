@@ -284,12 +284,33 @@ has_custom_icon() {
   [[ -f "$1/Icon"$'\r' ]]
 }
 
+# Main Claude processes (original bundle or clone) as "pid<TAB>executable".
+# Matched on the executable (`comm` is argv[0], the full path, spaces and
+# all), not on a substring of the command line, so `tail …/MacOS/Claude` or
+# a Helper process never counts.
+claude_mains() {
+  local pid exe
+  ps -axo pid=,comm= 2>/dev/null | while read -r pid exe; do
+    [[ "$exe" == */Contents/MacOS/Claude ]] && print -- "$pid"$'\t'"$exe"
+  done || true
+}
+
+# True when the command line carries exactly --user-data-dir=<dir>. `ps`
+# joins argv with spaces, so ".../Claude-Work" is a prefix of
+# ".../Claude-Work Two"; the flag must end the line or precede another flag.
+# Profile names never contain " -" (displayify), so this is unambiguous.
+has_data_dir_arg() {
+  local cmd="$1" arg="--user-data-dir=$2"
+  [[ "$cmd" == *" $arg" || "$cmd" == *" $arg -"* ]]
+}
+
 # PID of the main Claude process using this data dir (any bundle — original
-# or clone), empty when not running. The trailing `|| true` matters: under
-# `set -euo pipefail` a no-match grep (exit 1) would otherwise kill the
-# whole script at the call site's assignment.
+# or clone), empty when not running.
 instance_pid() {
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$1" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | awk '{print $1}' | head -1 || true
+  local pid exe
+  claude_mains | while IFS=$'\t' read -r pid exe; do
+    has_data_dir_arg "$(ps -o command= -p "$pid" 2>/dev/null)" "$1" && { print -- "$pid"; break }
+  done || true
 }
 
 # Claude Code's config dir for this profile. --user-data-dir only scopes
@@ -333,12 +354,12 @@ launch_clone() {
 # still titled "Claude <Profile>". Args are the only thing `ps` lets us
 # check (hardened runtime hides env), and both are dropped together.
 stray_pids() {
-  local line pid cmd rest display
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "$CLONES_DIR/" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | grep -vF -- "--user-data-dir=" | while IFS= read -r line; do
-    pid="${line##[[:space:]]#}"; pid="${pid%% *}"
-    cmd="${line#*"$CLONES_DIR/"}"
-    display="${${cmd%%.app/Contents/MacOS/Claude*}#Claude }"
-    [[ -n "$display" ]] && print -- "$pid"$'\t'"$display"
+  local pid exe display
+  claude_mains | while IFS=$'\t' read -r pid exe; do
+    [[ "$exe" == "$CLONES_DIR/Claude "*.app/Contents/MacOS/Claude ]] || continue
+    [[ "$(ps -o command= -p "$pid" 2>/dev/null)" == *--user-data-dir=* ]] && continue
+    display="${${exe#"$CLONES_DIR/Claude "}%.app/Contents/MacOS/Claude}"
+    [[ -n "$display" && "$display" != */* ]] && print -- "$pid"$'\t'"$display"
   done || true
 }
 
